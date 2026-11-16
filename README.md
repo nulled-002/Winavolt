@@ -3,7 +3,9 @@ A classic Winamp 2.x skin front end for spotify(free) desktop client.
 
 #Screenshots:
 
-<img width="277" height="457" alt="Screenshot_2026-11-15_20-08-33" src="https://github.com/user-attachments/assets/7d9951c1-773a-48bc-844b-b48a7ee1e78c" />
+<img width="275" height="347" alt="Screenshot_2026-11-15_20-14-13" src="https://github.com/user-attachments/assets/b883263f-0c17-44ee-95d8-29cf3b514a8b" />
 
-<img width="277" height="463" alt="Screenshot_2026-10-20_17-48-05" src="https://github.com/user-attachments/assets/dc7bde3a-6ad3-44a8-a1c8-7340979e9f0c" />
+<img width="273" height="343" alt="Screenshot_2026-11-16_16-34-18" src="https://github.com/user-attachments/assets/23d06fe8-fcb8-469c-9191-386b334f988e" />
+
+<img width="269" height="344" alt="Screenshot_2026-11-16_16-36-48" src="https://github.com/user-attachments/assets/84d9b16e-9ad7-4d89-a702-d73e75bbafb2" />
 
