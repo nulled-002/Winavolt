@@ -1,7 +1,7 @@
 # Winavolt
 A classic Winamp 2.x skin front end for spotify(free) desktop client.
 
-#Screenshots:
+# Screenshots
 
 <img width="275" height="347" alt="Screenshot_2026-11-15_20-14-13" src="https://github.com/user-attachments/assets/b883263f-0c17-44ee-95d8-29cf3b514a8b" />
 
