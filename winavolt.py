@@ -325,7 +325,11 @@ def setimg(item, img):
 
 
 M = {"shade": args.shade}   # current mode
-MP = {}                     # authoritative main-window position while dragging (WM reports it late)
+# Main-window position in the same coordinates we pass to geometry().  We own it: docked
+# windows are always placed from this, never from what the WM reports (which is late during
+# drags and can differ by frame offsets in managed mode).  "off" = WM-reported client origin
+# minus this position, learned once the window has settled.
+POS = {"x": 0, "y": 0, "off": None, "t": 0.0}
 D = {}                      # current mouse drag
 EMPTY = dict(ok=False, status="", vol=0.0, pos=0, length=0, artist="", title="",
              shuffle="Off", loop="None", ts=0.0, uri="")
@@ -690,15 +694,13 @@ def on_press(e):
         if 36 <= x < 99 and 24 <= y < 41:
             REMAINING["on"] = not REMAINING["on"]
             return
-    D.update(kind="win", ox=e.x_root - root.winfo_x(), oy=e.y_root - root.winfo_y())
+    D.update(kind="win", ox=e.x_root - POS["x"], oy=e.y_root - POS["y"])
 
 
 def on_motion(e):
     k, x = D.get("kind"), e.x / K
     if k == "win":
-        MP.update(x=e.x_root - D["ox"], y=e.y_root - D["oy"])
-        root.geometry(f"+{MP['x']}+{MP['y']}")
-        reposition_docked()
+        move_main(e.x_root - D["ox"], e.y_root - D["oy"])
     elif k == "seek":
         tx = max(16, min(235, x - 14.5))
         D["frac"] = (tx - 16) / 219
@@ -727,7 +729,8 @@ def on_release(e):
         setimg(vol_knob_item, vol_knob[0])
         run("volume", f"{D.get('frac', 0.0):.2f}")
     elif k == "win":
-        root.after(400, MP.clear)     # let the window manager catch up, then trust it again
+        POS["t"] = time.monotonic()
+        root.after(1200, learn_offset)
     D.clear()
 
 
@@ -814,7 +817,7 @@ def toggle_remaining():
 
 def restart(scale, top):
     argv = [sys.executable, os.path.abspath(__file__), args.skin, "--scale", str(scale),
-            "--player", PLAYER, "--pos", f"{root.winfo_x()},{root.winfo_y()}",
+            "--player", PLAYER, "--pos", f"{POS['x']},{POS['y']}",
             "--config", cfg_path,
             "--shade" if M["shade"] else "--no-shade",
             "--top" if top else "--no-top"]
@@ -845,6 +848,8 @@ menu.add_checkbutton(label="Always on top (restarts)", variable=var_top,
                      command=lambda: restart(K, var_top.get()))
 menu.add_command(label="Equalizer", command=lambda: EQW.toggle())
 menu.add_command(label="Playlist (play history)", command=lambda: PLW.toggle())
+menu.add_command(label="Float / dock equalizer", command=lambda: EQW.toggle_dock())
+menu.add_command(label="Float / dock playlist", command=lambda: PLW.toggle_dock())
 menu.add_command(label="Switch 1x / 2x (restarts)", command=rescale)
 menu.add_separator()
 menu.add_command(label="Minimize", command=minimize)
@@ -868,9 +873,8 @@ def apply_mode():
     h = 14 if shade else 116
     cv.config(height=h * K)
     setimg(bar_item, bar_shade if shade else bar_full)
-    root.geometry(f"{275 * K}x{h * K}")
+    resize_root()
     LAST_PP["v"] = None
-    reposition_docked()
 
 
 # ------------------------------------------------------------------ equalizer + playlist windows
@@ -1070,26 +1074,55 @@ class EqEngine:
 EQE = EqEngine()
 
 
-# ------------------------------------------------------------------ docking helpers
+# ------------------------------------------------------------------ equalizer / playlist panels
+# Docked panels live INSIDE the main window: one X window, so the whole stack moves in perfect
+# lockstep no matter how slowly the window manager handles moves.  Any panel can also be
+# floated into a window of its own (right-click it, or use the main menu).
 def set_top():
     for w in (root, EQW.top, PLW.top):
         if w is not None:
             w.attributes("-topmost", var_top.get())
 
 
-def dock_origin(win):
-    mx, my = MP.get("x", root.winfo_x()), MP.get("y", root.winfo_y())
-    y = my + (14 if M["shade"] else 116) * K
-    if win is PLW and EQW.visible and EQW.docked:
-        y += EQW.H * K
-    return mx, y
+def stack_h():
+    """Height of the main window in base pixels: player (or shade bar) + docked panels."""
+    return (14 if M["shade"] else 116) + sum(w.H for w in (EQW, PLW) if w.visible and w.docked)
 
 
-def reposition_docked():
+def resize_root():
+    root.geometry(f"{275 * K}x{stack_h() * K}")
+
+
+def restack():
     for w in (EQW, PLW):
-        if w.top is not None and w.visible and w.docked:
-            x, y = dock_origin(w)
-            w.top.geometry(f"{w.W * K}x{w.H * K}+{x}+{y}")
+        if w.slot is not None:
+            w.slot.pack_forget()
+    for w in (EQW, PLW):
+        if w.slot is not None and w.visible and w.docked:
+            w.slot.pack(side="top")
+    resize_root()
+
+
+def move_main(x, y):
+    POS.update(x=x, y=y, t=time.monotonic())
+    root.geometry(f"+{x}+{y}")
+
+
+def learn_offset():
+    if POS["off"] is None:
+        POS["off"] = (root.winfo_rootx() - POS["x"], root.winfo_rooty() - POS["y"])
+
+
+def sync_main_position(_e=None):
+    """Keep POS right when the window manager moves the window on its own (keyboard move,
+    clamping to the work area, tiling).  Ignored while dragging and for 1s after our own
+    move, so a late report of our own move is never mistaken for an external one."""
+    if POS["off"] is None or D.get("kind") == "win" or time.monotonic() - POS["t"] < 1.0:
+        return
+    nx = root.winfo_rootx() - POS["off"][0]
+    ny = root.winfo_rooty() - POS["off"][1]
+    if abs(nx - POS["x"]) > 2 or abs(ny - POS["y"]) > 2:
+        POS.update(x=nx, y=ny)
 
 
 class SubWin:
@@ -1097,13 +1130,34 @@ class SubWin:
     TITLE = "Winavolt"
 
     def __init__(self):
-        self.top = self.cv = None
+        self.top = self.cv = self.slot = None   # floating Toplevel | canvas | docked frame
         self.visible = False
         self.docked = True
         self.drag = None
+        self.px = self.py = 0       # position of the floating window (our own coordinates)
+
+    def host(self):
+        """Any live widget belonging to this panel (for menus, timers, dialogs)."""
+        return self.top if self.top is not None else self.cv
 
     def put(self, img, x, y, **kw):
         return self.cv.create_image(x * K, y * K, image=img, anchor="nw", **kw)
+
+    def _bind(self):
+        self.cv.bind("<ButtonPress-1>", self._press)
+        self.cv.bind("<B1-Motion>", self._motion)
+        self.cv.bind("<ButtonRelease-1>", self._release)
+        self.cv.bind("<Button-3>", self.panel_menu)
+
+    def make_docked(self):
+        self.slot = tk.Frame(root, width=self.W * K, height=self.H * K, bd=0,
+                             highlightthickness=0)
+        self.slot.pack_propagate(False)
+        self.cv = tk.Canvas(self.slot, width=self.W * K, height=self.H * K,
+                            highlightthickness=0, bd=0)
+        self.cv.pack()
+        self._bind()
+        self.build()
 
     def make_window(self):
         self.top = tk.Toplevel(root, class_="Winavolt")   # same class: panel groups it with the player
@@ -1121,30 +1175,76 @@ class SubWin:
         self.cv = tk.Canvas(self.top, width=self.W * K, height=self.H * K,
                             highlightthickness=0, bd=0)
         self.cv.pack()
-        self.cv.bind("<ButtonPress-1>", self._press)
-        self.cv.bind("<B1-Motion>", self._motion)
-        self.cv.bind("<ButtonRelease-1>", self._release)
+        self._bind()
         self.build()
+
+    def teardown(self):
+        w = self.top if self.top is not None else self.slot
+        if w is not None:
+            w.destroy()
+        self.top = self.cv = self.slot = None
+        self.visible = False
+        self.drag = None
+        self.anim_on = False        # lets an animated panel restart after a rebuild
 
     def toggle(self):
         self.hide() if self.visible else self.show()
 
     def show(self):
-        if self.top is None:
+        if self.cv is None:
             if not self.can_build():
                 return
-            self.make_window()
+            if self.docked:
+                self.make_docked()
+            else:
+                if self.px == 0 and self.py == 0:
+                    x, y = self.slot_origin()
+                    self.px, self.py = x + 30 * K, y + 30 * K
+                self.make_window()
         self.visible = True
         if self.docked:
-            reposition_docked()
-        self.top.deiconify()
+            restack()
+        else:
+            self.top.geometry(f"{self.W * K}x{self.H * K}+{self.px}+{self.py}")
+            self.top.deiconify()
         self.on_show()
 
     def hide(self):
-        if self.top is not None:
-            self.top.withdraw()
         self.visible = False
-        reposition_docked()
+        if self.cv is not None:
+            if self.docked:
+                self.slot.pack_forget()
+                restack()
+            else:
+                self.top.withdraw()
+
+    def slot_origin(self):
+        """Screen position the panel has (or would have) when docked under the player."""
+        y = POS["y"] + (14 if M["shade"] else 116) * K
+        for w in (EQW, PLW):
+            if w is self:
+                break
+            if w.visible and w.docked:
+                y += w.H * K
+        return POS["x"], y
+
+    def toggle_dock(self):
+        """Float the panel into its own window, or dock it back under the player."""
+        was_visible = self.visible
+        if self.cv is None:                     # never built yet: just remember the choice
+            self.docked = not self.docked
+            return
+        if self.docked:
+            x, y = self.slot_origin()
+            self.teardown()
+            self.docked = False
+            self.px, self.py = x + 30 * K, y + 30 * K
+        else:
+            self.teardown()
+            self.docked = True
+        restack()
+        if was_visible:
+            self.show()
 
     def can_build(self):
         return True
@@ -1152,30 +1252,49 @@ class SubWin:
     def on_show(self):
         pass
 
-    # --- mouse plumbing: subclasses implement click/drag_item/release
+    def panel_menu(self, e):
+        m = tk.Menu(self.host(), tearoff=0)
+        self.extra_menu(m)
+        m.add_command(label="Float in its own window" if self.docked else "Dock under the player",
+                      command=lambda: root.after(10, self.toggle_dock))
+        m.add_command(label="Close", command=lambda: root.after(10, self.hide))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def extra_menu(self, m):
+        pass
+
+    # --- mouse plumbing: subclasses implement click/drag_item/release.  Docked panels drag
+    # the whole stack (the main window); floating ones just move themselves.
     def _press(self, e):
         self.cv.focus_force()
         if self.click(e.x / K, e.y / K, e):
             return
-        self.drag = (e.x_root - self.top.winfo_x(), e.y_root - self.top.winfo_y())
+        if self.docked:
+            D.clear()
+            D.update(kind="win", ox=e.x_root - POS["x"], oy=e.y_root - POS["y"])
+        else:
+            self.drag = (e.x_root - self.px, e.y_root - self.py)
 
     def _motion(self, e):
         if self.drag_item(e):
             return
-        if self.drag:
+        if self.docked:
+            if D.get("kind") == "win":
+                on_motion(e)
+        elif self.drag:
             nx, ny = e.x_root - self.drag[0], e.y_root - self.drag[1]
-            dx, dy = dock_origin(self)
-            if abs(nx - dx) > 2 or abs(ny - dy) > 2:
-                self.docked = False
+            self.px, self.py = nx, ny
             self.top.geometry(f"+{nx}+{ny}")
 
     def _release(self, e):
-        if self.drag:
+        if self.docked:
+            if D.get("kind") == "win":
+                on_release(e)
+        else:
             self.drag = None
-            dx, dy = dock_origin(self)
-            if abs(self.top.winfo_x() - dx) < 20 * K and abs(self.top.winfo_y() - dy) < 20 * K:
-                self.docked = True
-                reposition_docked()
         self.release(e)
 
     def click(self, x, y, e):
@@ -1204,6 +1323,9 @@ class EqWin(SubWin):
         self.on = False
         self.pend = None
         self.sl = None
+        self._preset_menu_open = False
+        self._preset_menu_pending = False
+        self._preset_menu = None
 
     def can_build(self):
         if EQM is None:
@@ -1212,6 +1334,10 @@ class EqWin(SubWin):
         return True
 
     def build(self):
+        self.pend = None
+        self.sl = None
+        self._preset_menu_open = self._preset_menu_pending = False   # a rebuild destroys any open menu
+        self._preset_menu = None
         self.put(spr(EQM, 0, 0, 275, 116), 0, 0)
         self.put(spr(EQM, 0, 134, 275, 14), 0, 0)
         self.close_imgs = (spr(EQM, 0, 116, 9, 9), spr(EQM, 0, 125, 9, 9))
@@ -1237,6 +1363,7 @@ class EqWin(SubWin):
         for n in range(11):
             self.draw_slider(n)
         self.draw_graph()
+        self.refresh_on()
 
     # --- drawing
     def val(self, n):
@@ -1305,7 +1432,7 @@ class EqWin(SubWin):
             return
         if not EQE.available():
             messagebox.showerror("Equalizer", "Needs pipewire, pw-cli, pw-dump and pactl in PATH.",
-                                 parent=self.top)
+                                 parent=self.host())
             return
         self.on = True
         self.refresh_on()
@@ -1322,17 +1449,43 @@ class EqWin(SubWin):
     def failed(self, err):
         self.on = False
         self.refresh_on()
-        messagebox.showerror("Equalizer", err, parent=self.top)
+        messagebox.showerror("Equalizer", err, parent=self.host())
 
-    def presets_menu(self):
-        m = tk.Menu(self.top, tearoff=0)
+    def presets_menu(self, x=None, y=None):
+        # Ignore duplicate opens while a menu is already posted.  In
+        # particular, don't let the release that dismisses a menu reopen it.
+        if self._preset_menu_open:
+            return
+        self._preset_menu_open = True
+
+        m = tk.Menu(self.host(), tearoff=0)
+        self._preset_menu = m
         for name, vals in EQ_PRESETS.items():
             m.add_command(label=name, command=lambda v=vals: self.apply_preset(v))
-        x, y = self.top.winfo_pointerxy()
+
+        if x is None or y is None:
+            x, y = self.host().winfo_pointerxy()
+
+        def menu_closed(_event=None):
+            if self._preset_menu_open:
+                self._preset_menu_open = False
+                self._preset_menu = None
+
+        m.bind("<Unmap>", menu_closed, add="+")
         try:
             m.tk_popup(x, y)
         finally:
-            m.grab_release()
+            # tk_popup grabs the pointer; release it after posting so the
+            # canvas doesn't retain a stale grab after a selection/dismissal.
+            try:
+                m.grab_release()
+            except tk.TclError:
+                pass
+
+    def _post_presets(self, x, y):
+        self._preset_menu_pending = False
+        if self.host() is not None and self.host().winfo_exists():
+            self.presets_menu(x, y)
 
     # --- mouse
     def click(self, x, y, e):
@@ -1364,7 +1517,14 @@ class EqWin(SubWin):
                 elif name == "on":
                     self.toggle_on()
                 else:
-                    self.presets_menu()
+                    # Open after this ButtonRelease has fully propagated.
+                    # This prevents the popup's dismissal click from being
+                    # interpreted as another click on the preset button.
+                    if not self._preset_menu_pending and not self._preset_menu_open:
+                        self._preset_menu_pending = True
+                        self.host().after_idle(
+                            lambda px=e.x_root, py=e.y_root: self._post_presets(px, py)
+                        )
         if self.sl is not None:
             self.draw_slider(self.sl)
             self.sl = None
@@ -1581,7 +1741,7 @@ class PlWin(SubWin):
         self.cv.tag_raise("frame")      # frame on top clips the sliding text
 
     def animate(self):
-        if not self.visible or self.top is None:
+        if not self.visible or self.host() is None:
             self.anim_on = False
             return
         step = max(1, K)
@@ -1594,7 +1754,7 @@ class PlWin(SubWin):
                 a["off"], a["hold"] = 0, 25
             self.cv.coords(a["i1"], a["x0"] - a["off"], a["cy"])
             self.cv.coords(a["i2"], a["x0"] - a["off"] + a["period"], a["cy"])
-        self.top.after(40, self.animate)
+        self.host().after(40, self.animate)
 
     def row_at(self, x, y):
         if self.X0 <= x < self.W - 20 and self.Y0 <= y < self.Y0 + self.ROWS * self.ROWH:
@@ -1641,11 +1801,15 @@ class PlWin(SubWin):
         if i is not None:
             self.sel = i
             self.redraw()
-        m = tk.Menu(self.top, tearoff=0)
+        m = tk.Menu(self.host(), tearoff=0)
         m.add_command(label="Play", command=lambda: self.play(self.sel))
         m.add_command(label="Remove", command=lambda: self.remove(self.sel))
         m.add_separator()
         m.add_command(label="Clear history", command=self.clear)
+        m.add_separator()
+        m.add_command(label="Float in its own window" if self.docked else "Dock under the player",
+                      command=lambda: root.after(10, self.toggle_dock))
+        m.add_command(label="Close", command=lambda: root.after(10, self.hide))
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:
@@ -1661,8 +1825,9 @@ try:
 except ValueError:
     px, py = 100, 100
 root.geometry(f"+{px}+{py}")
-MP.update(x=px, y=py)
-root.after(1500, MP.clear)
+POS.update(x=px, y=py, t=time.monotonic())
+root.after(1500, learn_offset)
+root.bind("<Configure>", lambda e: sync_main_position() if e.widget is root else None)
 apply_mode()
 if MANAGED:
     strip_decor(root)
