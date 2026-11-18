@@ -9,10 +9,14 @@ A classic Winamp 2.x skin front end for spotify(free) desktop client.
 
 <img width="269" height="344" alt="Screenshot_2026-11-16_16-36-48" src="https://github.com/user-attachments/assets/84d9b16e-9ad7-4d89-a702-d73e75bbafb2" />
 
-Dependencies 
+Dependencies: 
 
 Debian : sudo apt install playerctl python3-tk python3-pil.imagetk x11-utils
+
 void : sudo xbps-install playerctl python3-tkinter python3-Pillow xprop
 
+Install: 
+
+./winavolt.py --install
 
 ** FOR USER MANUAL CHECK SOURCE CODE!**
