@@ -439,7 +439,7 @@ for sx, w, x, a in [(0, 23, 16, ("previous",)), (23, 23, 39, ("play",)),
                     (46, 23, 62, ("play-pause",)), (69, 23, 85, ("stop",)),
                     (92, 22, 108, ("next",))]:
     btn(x, 88, w, 18, spr(CB, sx, 0, w, 18), spr(CB, sx, 18, w, 18),
-        (lambda a=a: run(*a)), "full")
+        (lambda a=a: do_cmd(a)), "full")
 btn(136, 89, 22, 16, spr(CB, 114, 0, 22, 16), spr(CB, 114, 16, 22, 16),
     lambda: open_dialog(), "full")
 
@@ -662,6 +662,7 @@ def tick():
                 b.sel = on
                 b.show()
     PLW.note_track(st)
+    PLW.autoadvance(st, pos, length)
     for b, w in ((B_EQ, EQW), (B_PL, PLW)):
         if b and b.sel != w.visible:
             b.sel = w.visible
@@ -752,9 +753,18 @@ KEYS = {"z": ("previous",), "x": ("play",), "c": ("play-pause",), "v": ("stop",)
         "Up": ("volume", "0.05+"), "Down": ("volume", "0.05-")}
 
 
+def do_cmd(a):
+    """Transport command; Next/Previous follow the playlist being played, if there is one."""
+    if a == ("next",) and PLW.step(1):
+        return
+    if a == ("previous",) and PLW.step(-1):
+        return
+    run(*a)
+
+
 def on_key(e):
     if e.keysym in KEYS:
-        run(*KEYS[e.keysym])
+        do_cmd(KEYS[e.keysym])
     elif e.keysym == "s":
         toggle_shuffle()
     elif e.keysym == "r":
@@ -856,14 +866,56 @@ menu.add_command(label="Minimize", command=minimize)
 menu.add_command(label="Quit", command=root.destroy)
 
 
+_POPUP = {"m": None}
+
+
+def menu_is_open():
+    return _POPUP["m"] is not None
+
+
+def close_menu(_e=None):
+    m, _POPUP["m"] = _POPUP["m"], None
+    root.unbind_all("<ButtonPress>")
+    if m is not None:
+        for fn in (m.unpost, m.grab_release):
+            try:
+                fn()
+            except tk.TclError:
+                pass
+
+
+def popup_menu(m, x, y):
+    """Post a popup menu so that clicking anywhere else dismisses it.
+
+    On X11, tk_popup() takes a global pointer grab, and that grab is exactly what makes a
+    click outside the menu close it.  So it must NOT be released after posting (the usual
+    `finally: m.grab_release()` snippet breaks dismissal).  The bindings below are a safety
+    net for clicks inside our own windows and for the Escape key."""
+    close_menu()
+    _POPUP["m"] = m
+    name = str(m)
+
+    def away(e):
+        w = str(e.widget)
+        if w != name and not w.startswith(name + "."):
+            close_menu()
+
+    def closed(_e=None):
+        if _POPUP["m"] is m:
+            _POPUP["m"] = None
+            root.unbind_all("<ButtonPress>")
+
+    m.bind("<Unmap>", closed, add="+")
+    m.bind("<Escape>", close_menu, add="+")
+    root.bind_all("<ButtonPress>", away, add="+")
+    m.tk_popup(x, y)
+
+
 def show_menu(x=None, y=None):
     if x is None:
         x, y = root.winfo_pointerxy()
     var_rem.set(REMAINING["on"])
-    try:
-        menu.tk_popup(x, y)
-    finally:
-        menu.grab_release()
+    popup_menu(menu, x, y)
 
 
 def apply_mode():
@@ -880,7 +932,8 @@ def apply_mode():
 # ------------------------------------------------------------------ equalizer + playlist windows
 from tkinter import messagebox
 
-HIST_PATH = os.path.join(CONF_DIR, "history.json")
+HIST_PATH = os.path.join(CONF_DIR, "history.json")          # old format, still read for migration
+PLAYLISTS_PATH = os.path.join(CONF_DIR, "playlists.json")
 os.makedirs(CONF_DIR, exist_ok=True)
 
 EQ_BANDS = [60, 170, 310, 600, 1000, 3000, 6000, 12000, 14000, 16000]
@@ -1135,6 +1188,7 @@ class SubWin:
         self.docked = True
         self.drag = None
         self.px = self.py = 0       # position of the floating window (our own coordinates)
+        self.pend_open = False      # was a menu open when the current press started?
 
     def host(self):
         """Any live widget belonging to this panel (for menus, timers, dialogs)."""
@@ -1258,10 +1312,7 @@ class SubWin:
         m.add_command(label="Float in its own window" if self.docked else "Dock under the player",
                       command=lambda: root.after(10, self.toggle_dock))
         m.add_command(label="Close", command=lambda: root.after(10, self.hide))
-        try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
+        popup_menu(m, e.x_root, e.y_root)
 
     def extra_menu(self, m):
         pass
@@ -1472,15 +1523,7 @@ class EqWin(SubWin):
                 self._preset_menu = None
 
         m.bind("<Unmap>", menu_closed, add="+")
-        try:
-            m.tk_popup(x, y)
-        finally:
-            # tk_popup grabs the pointer; release it after posting so the
-            # canvas doesn't retain a stale grab after a selection/dismissal.
-            try:
-                m.grab_release()
-            except tk.TclError:
-                pass
+        popup_menu(m, x, y)
 
     def _post_presets(self, x, y):
         self._preset_menu_pending = False
@@ -1492,6 +1535,7 @@ class EqWin(SubWin):
         for name, r in self.CTRL.items():
             if inside(x, y, r):
                 self.pend = name
+                self.pend_open = menu_is_open()
                 self.set_down(name, True)
                 return True
         for n, (sx, _, _) in enumerate(self.sliders):
@@ -1520,7 +1564,8 @@ class EqWin(SubWin):
                     # Open after this ButtonRelease has fully propagated.
                     # This prevents the popup's dismissal click from being
                     # interpreted as another click on the preset button.
-                    if not self._preset_menu_pending and not self._preset_menu_open:
+                    if (not self.pend_open and not self._preset_menu_pending
+                            and not self._preset_menu_open):
                         self._preset_menu_pending = True
                         self.host().after_idle(
                             lambda px=e.x_root, py=e.y_root: self._post_presets(px, py)
@@ -1531,8 +1576,53 @@ class EqWin(SubWin):
 
 
 # ------------------------------------------------------------------ playlist (play history) window
+def ask_text(title, prompt, callback, initial=""):
+    """Small non-modal text prompt; calls callback(text) on OK."""
+    top = tk.Toplevel(root)
+    top.title(title)
+    top.attributes("-topmost", True)
+    top.geometry(f"+{POS['x'] + 20}+{POS['y'] + 20}")
+    tk.Label(top, text=prompt).pack(padx=12, pady=(12, 4))
+    ent = tk.Entry(top, width=44)
+    ent.pack(padx=12)
+    ent.insert(0, initial)
+    ent.select_range(0, "end")
+    ent.focus_force()
+
+    def ok(_e=None):
+        text = ent.get().strip()
+        top.destroy()
+        callback(text)
+
+    ent.bind("<Return>", ok)
+    top.bind("<Escape>", lambda _e: top.destroy())
+    row = tk.Frame(top)
+    row.pack(pady=10)
+    tk.Button(row, text="OK", width=8, command=ok).pack(side="left", padx=4)
+    tk.Button(row, text="Cancel", width=8, command=top.destroy).pack(side="left", padx=4)
+
+
+def fetch_title(uri, done):
+    """Best effort: ask Spotify's public oEmbed endpoint for a track's title (in a thread)."""
+    def work():
+        try:
+            import urllib.parse
+            import urllib.request
+            tid = uri.rsplit(":", 1)[-1]
+            url = ("https://open.spotify.com/oembed?url="
+                   + urllib.parse.quote(f"https://open.spotify.com/track/{tid}", safe=""))
+            with urllib.request.urlopen(url, timeout=6) as r:
+                title = json.load(r).get("title", "")
+        except Exception:
+            return
+        if title:
+            root.after(0, done, title)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 class PlWin(SubWin):
-    """Play-history window: a few big rows (config: playlist_rows), long text scrolls sideways."""
+    """Playlist window: the built-in History plus any playlists you create (ADD / REM / LIST)."""
     W, H = 275, 232
     TITLE = "Winavolt Playlist"
     X0, Y0 = 12, 20
@@ -1549,11 +1639,13 @@ class PlWin(SubWin):
         else:
             self.ROWS = min(args.pl_rows, 8)
             self.ROWH = (self.H - 38 - self.Y0) // self.ROWS
-        self.items = self.load()
+        self.lists, self.active = self.load()
+        self.queue_pl, self.queue_pos, self.adv_key = None, -1, None   # playlist being played through
+        self._menu_open, self._menu_t = False, 0.0
         self.cur = self.sel = -1
         self.top_i = 0
         self.last_uri = None
-        self.pend = False
+        self.pend = None
         self.last_click = (-1, 0.0)
         self.anim = []
         self.anim_on = False
@@ -1580,19 +1672,38 @@ class PlWin(SubWin):
             except tk.TclError:
                 self.cols[a] = d
 
+    @property
+    def items(self):
+        return self.lists[self.active]["items"]
+
     @staticmethod
     def load():
+        """-> (playlists, active index).  Picks up the old history.json on first run."""
+        def clean(items):
+            return [d for d in items if isinstance(d, dict) and d.get("uri")]
+        lists, active = [], 0
         try:
-            with open(HIST_PATH) as f:
+            with open(PLAYLISTS_PATH) as f:
                 data = json.load(f)
-            return [d for d in data if isinstance(d, dict) and d.get("uri")][-500:]
+            lists = [dict(name=str(p.get("name") or "Playlist"), history=bool(p.get("history")),
+                          items=clean(p.get("items", [])))
+                     for p in data.get("playlists", []) if isinstance(p, dict)]
+            active = int(data.get("active", 0))
         except Exception:
-            return []
+            try:
+                with open(HIST_PATH) as f:
+                    lists = [dict(name="History", history=True, items=clean(json.load(f))[-500:])]
+            except Exception:
+                pass
+        if not any(p["history"] for p in lists):
+            active = active + 1 if lists else 0
+            lists.insert(0, dict(name="History", history=True, items=[]))
+        return lists, max(0, min(active, len(lists) - 1))
 
     def save(self):
         try:
-            with open(HIST_PATH, "w") as f:
-                json.dump(self.items, f)
+            with open(PLAYLISTS_PATH, "w") as f:
+                json.dump(dict(version=2, active=self.active, playlists=self.lists), f)
         except Exception:
             pass
 
@@ -1638,6 +1749,8 @@ class PlWin(SubWin):
         else:
             self.f1 = tkfont.Font(family=fam, size=-max(7, int(self.ROWH * 0.36)) * K)
             self.f2 = tkfont.Font(family=fam, size=-max(6, int(self.ROWH * 0.25)) * K)
+        self.f3 = tkfont.Font(family=fam, size=-8 * K)
+        self._menu_open = False
         self.cv.bind("<Button-3>", self.popup)
         for ev in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
             self.cv.bind(ev, self.wheel)
@@ -1650,6 +1763,31 @@ class PlWin(SubWin):
             self.animate()
 
     # --- model
+    def queue_items(self):
+        pl = self.queue_pl
+        return pl["items"] if pl is not None and any(p is pl for p in self.lists) else None
+
+    def recompute_cur(self):
+        u = self.last_uri
+        self.cur = next((i for i, it in enumerate(self.items) if it["uri"] == u), -1) if u else -1
+
+    def scroll_to(self, i):
+        if not self.top_i <= i < self.top_i + self.ROWS:
+            self.top_i = max(0, i - self.ROWS + 1)
+
+    def learn_meta(self, uri, st):
+        """Fill in artist/title/length of tracks that were added by link, once they play."""
+        changed = False
+        for p in self.lists:
+            for it in p["items"]:
+                if it["uri"] == uri:
+                    for k, v in (("artist", st["artist"]), ("title", st["title"]),
+                                 ("length", st["length"] // 1_000_000)):
+                        if v and it.get(k) != v:
+                            it[k] = v
+                            changed = True
+        return changed
+
     def note_track(self, st):
         uri = st.get("uri", "")
         if not st["ok"] or uri == self.last_uri:
@@ -1658,33 +1796,208 @@ class PlWin(SubWin):
         if not uri:
             self.cur = -1
             return
-        if not any(it["uri"] == uri for it in self.items):
-            self.items.append(dict(uri=uri, artist=st["artist"], title=st["title"],
-                                   length=st["length"] // 1_000_000))
-            if len(self.items) > 500:
-                del self.items[0]
-                self.sel = max(-1, self.sel - 1)
+        changed = self.learn_meta(uri, st)
+        hist = next(p for p in self.lists if p["history"])
+        if not any(it["uri"] == uri for it in hist["items"]):
+            hist["items"].append(dict(uri=uri, artist=st["artist"], title=st["title"],
+                                      length=st["length"] // 1_000_000))
+            if len(hist["items"]) > 500:
+                del hist["items"][0]
+                if hist is self.lists[self.active]:
+                    self.sel = max(-1, self.sel - 1)
+            changed = True
+        qi = self.queue_items()          # keep the play-through position in step with reality
+        if qi is not None:
+            if 0 <= self.queue_pos < len(qi) and qi[self.queue_pos]["uri"] == uri:
+                pass
+            else:
+                idx = next((i for i, it in enumerate(qi) if it["uri"] == uri), None)
+                if idx is None:
+                    self.queue_pl = None     # something else started playing: leave the playlist
+                else:
+                    self.queue_pos = idx
+        if changed:
             self.save()
-        self.cur = next(i for i, it in enumerate(self.items) if it["uri"] == uri)
+        self.recompute_cur()
         if self.cv is not None:
-            if not self.top_i <= self.cur < self.top_i + self.ROWS:
-                self.top_i = max(0, self.cur - self.ROWS + 1)
+            if self.cur >= 0:
+                self.scroll_to(self.cur)
             self.redraw()
+
+    def autoadvance(self, st, pos, length):
+        """When a track of the playlist being played through is about to end, start the next."""
+        items = self.queue_items()
+        if items is None or st["status"] != "Playing" or not length or pos < 2_000_000:
+            return
+        if not 0 <= self.queue_pos < len(items) or items[self.queue_pos]["uri"] != st.get("uri"):
+            return
+        if length - pos > 700_000:
+            return
+        key = (st["uri"], self.queue_pos)
+        if self.adv_key == key:
+            return
+        self.adv_key = key
+        self.step(1)
+
+    def step(self, d):
+        """Next/previous within the playlist being played through.  False = not handled."""
+        items = self.queue_items()
+        if items is None:
+            return False
+        j = self.queue_pos + d
+        if not 0 <= j < len(items):
+            return False
+        self.queue_pos, self.adv_key = j, None
+        run("open", items[j]["uri"])
+        return True
 
     def play(self, i):
         if 0 <= i < len(self.items):
+            pl = self.lists[self.active]
+            self.queue_pl = None if pl["history"] else pl    # custom playlists play through
+            self.queue_pos, self.adv_key = i, None
             run("open", self.items[i]["uri"])
 
-    def remove(self, i):
-        if 0 <= i < len(self.items):
-            del self.items[i]
-            self.cur = -1 if i == self.cur else (self.cur - 1 if i < self.cur else self.cur)
-            self.sel = -1
+    # ---- playlists
+    def switch(self, i):
+        if not 0 <= i < len(self.lists):
+            return
+        self.active = i
+        self.sel, self.top_i = -1, 0
+        self.recompute_cur()
+        if self.cur >= 0:
+            self.scroll_to(self.cur)
+        self.save()
+        self.redraw()
+
+    def new_playlist(self, name):
+        name = (name or "").strip() or f"Playlist {sum(1 for p in self.lists if not p['history']) + 1}"
+        base, n = name, 2
+        while any(p["name"].lower() == name.lower() for p in self.lists):
+            name, n = f"{base} ({n})", n + 1
+        self.lists.append(dict(name=name, history=False, items=[]))
+        self.switch(len(self.lists) - 1)
+
+    def rename(self, name):
+        pl = self.lists[self.active]
+        if not name or pl["history"]:
+            return
+        if any(p is not pl and p["name"].lower() == name.lower() for p in self.lists):
+            messagebox.showinfo("Winavolt", "There is already a playlist with that name.",
+                                parent=self.host())
+            return
+        pl["name"] = name
+        self.save()
+        self.redraw()
+
+    def delete_playlist(self, i):
+        if not 0 <= i < len(self.lists):
+            return
+        pl = self.lists[i]
+        if pl["history"]:
+            if messagebox.askyesno("Winavolt", "History is built in and can't be deleted.\n"
+                                   "Clear all of its tracks instead?", parent=self.host()):
+                self.switch(i)
+                self.clear_active(confirm=False)
+            return
+        if not messagebox.askyesno("Winavolt", f"Delete the playlist \u201c{pl['name']}\u201d "
+                                   f"and its {len(pl['items'])} tracks?", parent=self.host()):
+            return
+        if self.queue_pl is pl:
+            self.queue_pl = None
+        del self.lists[i]
+        if self.active == i:
+            self.active = max(0, i - 1)
+        elif self.active > i:
+            self.active -= 1
+        self.sel, self.top_i = -1, 0
+        self.recompute_cur()
+        self.save()
+        self.redraw()
+
+    # ---- tracks
+    def add_uri(self, uri, artist="", title="", length=0):
+        if not uri.startswith("spotify:track:"):
+            return
+        items = self.items
+        for n, it in enumerate(items):
+            if it["uri"] == uri:                     # already in this playlist: just show it
+                self.sel = n
+                self.scroll_to(n)
+                self.redraw()
+                return
+        items.append(dict(uri=uri, artist=artist, title=title, length=length))
+        self.sel = len(items) - 1
+        self.scroll_to(self.sel)
+        self.recompute_cur()
+        self.save()
+        self.redraw()
+        if not title:
+            fetch_title(uri, lambda t, it=items[-1]: self.set_title(it, t))
+
+    def set_title(self, it, title):
+        if not it.get("title"):
+            it["title"] = title
             self.save()
             self.redraw()
 
-    def clear(self):
-        self.items, self.cur, self.sel, self.top_i, self.last_uri = [], -1, -1, 0, None
+    def add_current(self):
+        st = STATE
+        if st["ok"] and st.get("uri"):
+            self.add_uri(st["uri"], st["artist"], st["title"], st["length"] // 1_000_000)
+        else:
+            messagebox.showinfo("Winavolt", "Nothing is playing right now.", parent=self.host())
+
+    def add_link(self, text):
+        if not text:
+            return
+        uri = to_uri(text)
+        if not uri or not uri.startswith("spotify:track:"):
+            messagebox.showinfo("Winavolt",
+                                "That isn't a Spotify track link.\n(Albums and playlists can't be "
+                                "expanded without Spotify's API - add their tracks one by one.)",
+                                parent=self.host())
+            return
+        self.add_uri(uri)
+
+    def copy_selected(self, j):
+        if not (0 <= self.sel < len(self.items) and 0 <= j < len(self.lists)):
+            return
+        it = dict(self.items[self.sel])
+        dest = self.lists[j]["items"]
+        if not any(d["uri"] == it["uri"] for d in dest):
+            dest.append(it)
+            self.save()
+
+    def remove(self, i):
+        items = self.items
+        if not 0 <= i < len(items):
+            return
+        if self.queue_pl is self.lists[self.active]:
+            if i == self.queue_pos:
+                self.queue_pl = None
+            elif i < self.queue_pos:
+                self.queue_pos -= 1
+        del items[i]
+        self.cur = -1 if i == self.cur else (self.cur - 1 if i < self.cur else self.cur)
+        self.sel = -1
+        self.save()
+        self.redraw()
+
+    def clear_active(self, confirm=True):
+        pl = self.lists[self.active]
+        if not pl["items"]:
+            return
+        if confirm and not messagebox.askyesno(
+                "Winavolt", f"Remove all {len(pl['items'])} tracks from \u201c{pl['name']}\u201d?",
+                parent=self.host()):
+            return
+        del pl["items"][:]
+        self.cur, self.sel, self.top_i = -1, -1, 0
+        if pl["history"]:
+            self.last_uri = None        # the track playing now gets re-added to History
+        if self.queue_pl is pl:
+            self.queue_pl = None
         self.save()
         self.redraw()
 
@@ -1719,12 +2032,13 @@ class PlWin(SubWin):
                                          fill=self.cols["SelectedBG"], outline="", tags="row")
             fg = self.cols["Current"] if i == self.cur else self.cols["Normal"]
             artist, title = it.get("artist", ""), it.get("title", "")
+            short = it["uri"].rsplit(":", 1)[-1]      # shown until the real title is known
             dur = ""
             if it.get("length"):
                 m, s = divmod(int(it["length"]), 60)
                 dur = f"{m}:{s:02d}"
             if self.classic:
-                label = f"{i + 1}. " + " - ".join(x for x in (artist, title) if x)
+                label = f"{i + 1}. " + (" - ".join(x for x in (artist, title) if x) or short)
                 right = (self.W - 20 - 3) * K
                 clip = right - (self.f1.measure("00:00") + 8 * K) if dur else right
                 self.line(label, self.f1, fg, y + self.ROWH / 2, right=clip)
@@ -1735,10 +2049,11 @@ class PlWin(SubWin):
                     self.cv.create_text(right, (y + self.ROWH / 2) * K, anchor="e", text=dur,
                                         font=self.f1, fill=fg, tags="row")
             else:
-                self.line(f"{i + 1}. {title or artist}", self.f1, fg, y + self.ROWH * 0.30)
+                self.line(f"{i + 1}. {title or artist or short}", self.f1, fg, y + self.ROWH * 0.30)
                 self.line("  -  ".join(x for x in (artist if title else "", dur) if x) or " ",
                           self.f2, fg, y + self.ROWH * 0.72)
         self.cv.tag_raise("frame")      # frame on top clips the sliding text
+        self.draw_label()
 
     def animate(self):
         if not self.visible or self.host() is None:
@@ -1756,6 +2071,23 @@ class PlWin(SubWin):
             self.cv.coords(a["i2"], a["x0"] - a["off"] + a["period"], a["cy"])
         self.host().after(40, self.animate)
 
+    def draw_label(self):
+        """Name and size of the open playlist, in the skin's little black display."""
+        self.cv.delete("label")
+        pl = self.lists[self.active]
+        text = f"{pl['name']} ({len(pl['items'])})"
+        x0, y0, x1, y1 = 130, self.H - 31, 221, self.H - 21
+        avail = (x1 - x0 - 4) * K
+        t = text
+        while len(t) > 1 and self.f3.measure(t + ("\u2026" if t != text else "")) > avail:
+            t = t[:-1]
+        if t != text:
+            t += "\u2026"
+        self.cv.create_rectangle(x0 * K, y0 * K, x1 * K, y1 * K, fill=self.cols["NormalBG"],
+                                 outline="", tags="label")
+        self.cv.create_text((x0 + 2) * K, (y0 + y1) / 2 * K, anchor="w", text=t, font=self.f3,
+                            fill=self.cols["Normal"], tags="label")
+
     def row_at(self, x, y):
         if self.X0 <= x < self.W - 20 and self.Y0 <= y < self.Y0 + self.ROWS * self.ROWH:
             i = self.top_i + int((y - self.Y0) // self.ROWH)
@@ -1763,10 +2095,17 @@ class PlWin(SubWin):
         return None
 
     # --- mouse / keys
+    def zones(self):
+        by = self.H - 31
+        return {"close": (self.W - 11, 3, 9, 9), "add": (10, by, 26, 18),
+                "rem": (39, by, 26, 18), "list": (227, by, 26, 18)}
+
     def click(self, x, y, e):
-        if inside(x, y, (self.W - 11, 3, 9, 9)):
-            self.pend = True
-            return True
+        for name, r in self.zones().items():
+            if inside(x, y, r):
+                self.pend = name
+                self.pend_open = menu_is_open()
+                return True
         if self.X0 <= x < self.W - 20 and self.Y0 <= y < self.H - 38:
             i = self.row_at(x, y)
             if i is not None:
@@ -1781,9 +2120,13 @@ class PlWin(SubWin):
 
     def release(self, e):
         if self.pend:
-            self.pend = False
-            if inside(e.x / K, e.y / K, (self.W - 11, 3, 9, 9)):
-                self.hide()
+            name, self.pend = self.pend, None
+            if inside(e.x / K, e.y / K, self.zones()[name]):
+                if name == "close":
+                    self.hide()
+                elif not self.pend_open:       # the click that closed a menu mustn't reopen it
+                    self.post({"add": self.build_add, "rem": self.build_rem,
+                               "list": self.build_list}[name], e.x_root, e.y_root)
 
     def wheel(self, e):
         up = getattr(e, "num", 0) == 4 or getattr(e, "delta", 0) > 0
@@ -1796,24 +2139,88 @@ class PlWin(SubWin):
         elif e.keysym == "Return":
             self.play(self.sel)
 
+    # --- menus (ADD / REM / LIST buttons and the right-click menu)
+    def post(self, builder, x, y):
+        def go():
+            if self.host() is not None:
+                popup_menu(builder(self.host()), x, y)
+
+        self.host().after_idle(go)
+
+    def build_add(self, parent):
+        m = tk.Menu(parent, tearoff=0)
+        others = [j for j in range(len(self.lists)) if j != self.active]
+        m.add_command(label="New playlist\u2026", command=lambda: root.after(10, self.ask_new))
+        m.add_separator()
+        m.add_command(label="Add the track that is playing now", command=self.add_current)
+        m.add_command(label="Add a Spotify track link\u2026",
+                      command=lambda: root.after(10, self.ask_link))
+        sub = tk.Menu(m, tearoff=0)
+        for j in others:
+            sub.add_command(label=self.lists[j]["name"], command=lambda j=j: self.copy_selected(j))
+        ok = 0 <= self.sel < len(self.items) and bool(others)
+        m.add_cascade(label="Copy selected track to", menu=sub,
+                      state="normal" if ok else "disabled")
+        return m
+
+    def build_rem(self, parent):
+        m = tk.Menu(parent, tearoff=0)
+        m.add_command(label="Remove selected track",
+                      state="normal" if 0 <= self.sel < len(self.items) else "disabled",
+                      command=lambda: self.remove(self.sel))
+        m.add_command(label="Remove all tracks from this playlist",
+                      command=lambda: root.after(10, self.clear_active))
+        m.add_separator()
+        sub = tk.Menu(m, tearoff=0)
+        for i, p in enumerate(self.lists):
+            sub.add_command(label=p["name"] + ("   (built in: clears it)" if p["history"] else ""),
+                            command=lambda i=i: root.after(10, self.delete_playlist, i))
+        m.add_cascade(label="Delete a whole playlist", menu=sub)
+        return m
+
+    def build_list(self, parent):
+        m = tk.Menu(parent, tearoff=0)
+        for i, p in enumerate(self.lists):
+            mark = "\u25cf " if i == self.active else "    "
+            m.add_command(label=f"{mark}{p['name']}   ({len(p['items'])})",
+                          command=lambda i=i: self.switch(i))
+        m.add_separator()
+        m.add_command(label="New playlist\u2026", command=lambda: root.after(10, self.ask_new))
+        m.add_command(label="Rename this playlist\u2026",
+                      state="disabled" if self.lists[self.active]["history"] else "normal",
+                      command=lambda: root.after(10, self.ask_rename))
+        return m
+
+    def ask_new(self):
+        n = sum(1 for p in self.lists if not p["history"]) + 1
+        ask_text("New playlist", "Name for the new playlist:", self.new_playlist, f"Playlist {n}")
+
+    def ask_rename(self):
+        ask_text("Rename playlist", "New name:", self.rename, self.lists[self.active]["name"])
+
+    def ask_link(self):
+        ask_text("Add a track", "Spotify track link or URI:", self.add_link)
+
     def popup(self, e):
         i = self.row_at(e.x / K, e.y / K)
         if i is not None:
             self.sel = i
             self.redraw()
-        m = tk.Menu(self.host(), tearoff=0)
-        m.add_command(label="Play", command=lambda: self.play(self.sel))
-        m.add_command(label="Remove", command=lambda: self.remove(self.sel))
-        m.add_separator()
-        m.add_command(label="Clear history", command=self.clear)
-        m.add_separator()
-        m.add_command(label="Float in its own window" if self.docked else "Dock under the player",
-                      command=lambda: root.after(10, self.toggle_dock))
-        m.add_command(label="Close", command=lambda: root.after(10, self.hide))
-        try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
+
+        def builder(parent):
+            m = tk.Menu(parent, tearoff=0)
+            m.add_command(label="Play", command=lambda: self.play(self.sel))
+            m.add_separator()
+            m.add_cascade(label="Playlists", menu=self.build_list(m))
+            m.add_cascade(label="Add", menu=self.build_add(m))
+            m.add_cascade(label="Remove", menu=self.build_rem(m))
+            m.add_separator()
+            m.add_command(label="Float in its own window" if self.docked else "Dock under the player",
+                          command=lambda: root.after(10, self.toggle_dock))
+            m.add_command(label="Close", command=lambda: root.after(10, self.hide))
+            return m
+
+        self.post(builder, e.x_root, e.y_root)
 
 
 EQW = EqWin()
