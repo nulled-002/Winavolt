@@ -334,7 +334,7 @@ D = {}                      # current mouse drag
 EMPTY = dict(ok=False, status="", vol=0.0, pos=0, length=0, artist="", title="",
              shuffle="Off", loop="None", ts=0.0, uri="")
 STATE = dict(EMPTY, ts=time.monotonic())
-HOLD = {"shuffle": 0.0, "loop": 0.0}   # briefly trust optimistic values
+HOLD = {"shuffle": 0.0, "loop": 0.0, "vol": 0.0, "pos": 0.0}   # briefly trust optimistic values
 POKE = threading.Event()
 REMAINING = {"on": False}
 
@@ -380,6 +380,10 @@ def poller():
                 old = STATE
                 new["shuffle"] = old["shuffle"] if now < HOLD["shuffle"] else (pc("shuffle") or "Off")
                 new["loop"] = old["loop"] if now < HOLD["loop"] else (pc("loop") or "None")
+                if now < HOLD["vol"]:           # we just set the volume: a poll that raced the
+                    new["vol"] = old["vol"]     # change would flick the slider back to the old value
+                if now < HOLD["pos"]:           # same for a seek we just made
+                    new["pos"], new["ts"] = old["pos"], old["ts"]
                 STATE = new
         else:
             STATE = dict(EMPTY, ts=now)
@@ -710,6 +714,10 @@ def on_motion(e):
     elif k == "vol":
         D["frac"] = max(0.0, min(1.0, (x - 114) / 54))
         show_volume(D["frac"])
+        now = time.monotonic()
+        if now - D.get("sent", 0.0) > 0.12:      # live volume while dragging, ~8 updates/s
+            D["sent"] = now
+            set_volume(D["frac"])
 
 
 def on_release(e):
@@ -725,10 +733,11 @@ def on_release(e):
         setimg(seek_item, seek_img[0])
         f = D.get("frac", 0.0)
         STATE = {**STATE, "pos": int(f * STATE["length"]), "ts": time.monotonic()}
+        HOLD["pos"] = time.monotonic() + 1.0
         run("position", f"{f * STATE['length'] / 1e6:.2f}")
     elif k == "vol":
         setimg(vol_knob_item, vol_knob[0])
-        run("volume", f"{D.get('frac', 0.0):.2f}")
+        set_volume(D.get("frac", 0.0))
     elif k == "win":
         POS["t"] = time.monotonic()
         root.after(1200, learn_offset)
@@ -737,7 +746,7 @@ def on_release(e):
 
 def on_wheel(e):
     up = getattr(e, "num", 0) == 4 or getattr(e, "delta", 0) > 0
-    run("volume", "0.05+" if up else "0.05-")
+    do_cmd(("volume", "0.05+" if up else "0.05-"))
 
 
 cv.bind("<ButtonPress-1>", on_press)
@@ -753,11 +762,25 @@ KEYS = {"z": ("previous",), "x": ("play",), "c": ("play-pause",), "v": ("stop",)
         "Up": ("volume", "0.05+"), "Down": ("volume", "0.05-")}
 
 
+def set_volume(v, send=True):
+    """Move the volume right away (optimistic) and tell Spotify; polls can't undo it for 1.5 s."""
+    global STATE
+    v = max(0.0, min(1.0, v))
+    STATE = {**STATE, "vol": v}
+    HOLD["vol"] = time.monotonic() + 1.5
+    if send:
+        run("volume", f"{v:.2f}")
+
+
 def do_cmd(a):
     """Transport command; Next/Previous follow the playlist being played, if there is one."""
     if a == ("next",) and PLW.step(1):
         return
     if a == ("previous",) and PLW.step(-1):
+        return
+    if a[0] == "volume" and a[1][-1] in "+-":      # wheel / Up / Down keys
+        d = float(a[1][:-1]) * (1 if a[1][-1] == "+" else -1)
+        set_volume(STATE["vol"] + d)
         return
     run(*a)
 
